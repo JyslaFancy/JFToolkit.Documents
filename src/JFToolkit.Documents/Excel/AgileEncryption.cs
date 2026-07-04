@@ -270,6 +270,13 @@ internal static class AgileEncryption
         var dataIntegrity = xml.Element(ns + "dataIntegrity")
             ?? throw new InvalidDataException("Missing dataIntegrity in EncryptionInfo.");
 
+        // Find the password keyEncryptor (p: namespace)
+        XNamespace p = "http://schemas.microsoft.com/office/2006/keyEncryptor/password";
+        var keyEncryptors = keyData.Element(ns + "keyEncryptors");
+        var keyEncryptor = keyEncryptors?.Elements(ns + "keyEncryptor")
+            .FirstOrDefault(ke => ke.Attribute("uri")?.Value == p.NamespaceName)
+            ?? throw new InvalidDataException("Missing p:keyEncryptor in EncryptionInfo.");
+
         var encHmacKey = dataIntegrity.Attribute("encryptedHmacKey")?.Value
                 ?? throw new InvalidDataException("Missing encryptedHmacKey.");
         var encHmacValue = dataIntegrity.Attribute("encryptedHmacValue")?.Value
@@ -280,11 +287,11 @@ internal static class AgileEncryption
             PackageSalt: Convert.FromBase64String(keyData.Attribute("saltValue")?.Value ?? ""),
             HmacSalt: Array.Empty<byte>(),
             SpinCount: int.Parse(keyData.Attribute("spinCount")?.Value ?? "100000"),
-            EncryptedKeyValue: Convert.FromBase64String(keyData.Element(ns + "encryptedKey")?.Attribute("encryptedKeyValue")?.Value
+            EncryptedKeyValue: Convert.FromBase64String(keyEncryptor.Element(p + "encryptedKey")?.Attribute("encryptedKeyValue")?.Value
                 ?? throw new InvalidDataException("Missing encryptedKeyValue.")),
-            EncryptedVerifier: Convert.FromBase64String(keyData.Element(ns + "encryptedVerifier")?.Attribute("encryptedVerifierValue")?.Value
+            EncryptedVerifier: Convert.FromBase64String(keyEncryptor.Element(p + "encryptedVerifier")?.Attribute("encryptedVerifierValue")?.Value
                 ?? throw new InvalidDataException("Missing encryptedVerifierValue.")),
-            EncryptedVerifierHash: Convert.FromBase64String(keyData.Element(ns + "encryptedVerifierHash")?.Attribute("encryptedVerifierHashValue")?.Value
+            EncryptedVerifierHash: Convert.FromBase64String(keyEncryptor.Element(p + "encryptedVerifierHash")?.Attribute("encryptedVerifierHashValue")?.Value
                 ?? throw new InvalidDataException("Missing encryptedVerifierHashValue.")),
             EncryptedHmacKey: Convert.FromBase64String(encHmacKey),
             EncryptedHmacValue: Convert.FromBase64String(encHmacValue)
@@ -419,8 +426,10 @@ internal static class AgileEncryption
         byte[] encryptedHmacKey, byte[] encryptedHmacValue)
     {
         XNamespace ns = "http://schemas.microsoft.com/office/2006/encryption";
+        XNamespace p = "http://schemas.microsoft.com/office/2006/keyEncryptor/password";
 
         var doc = new XElement(ns + "encryption",
+            new XAttribute(XNamespace.Xmlns + "p", p),
             new XElement(ns + "keyData",
                 new XAttribute("saltSize", SaltSize),
                 new XAttribute("blockSize", BlockSize),
@@ -431,21 +440,24 @@ internal static class AgileEncryption
                 new XAttribute("hashAlgorithm", "SHA512"),
                 new XAttribute("saltValue", Convert.ToBase64String(keySalt)),
                 new XAttribute("spinCount", spinCount),
-                new XElement(ns + "encryptedKey",
-                    new XAttribute("spinCount", spinCount),
-                    new XAttribute("saltValue", Convert.ToBase64String(keySalt)),
-                    new XAttribute("encryptedKeyValue",
-                        Convert.ToBase64String(encryptedKeyValue))),
-                new XElement(ns + "encryptedVerifier",
-                    new XAttribute("spinCount", spinCount),
-                    new XAttribute("saltValue", Convert.ToBase64String(keySalt)),
-                    new XAttribute("encryptedVerifierValue",
-                        Convert.ToBase64String(encryptedVerifier))),
-                new XElement(ns + "encryptedVerifierHash",
-                    new XAttribute("spinCount", spinCount),
-                    new XAttribute("saltValue", Convert.ToBase64String(keySalt)),
-                    new XAttribute("encryptedVerifierHashValue",
-                        Convert.ToBase64String(encryptedVerifierHash)))),
+                new XElement(ns + "keyEncryptors",
+                    new XElement(ns + "keyEncryptor",
+                        new XAttribute("uri", p.NamespaceName),
+                        new XElement(p + "encryptedKey",
+                            new XAttribute("spinCount", spinCount),
+                            new XAttribute("saltValue", Convert.ToBase64String(keySalt)),
+                            new XAttribute("encryptedKeyValue",
+                                Convert.ToBase64String(encryptedKeyValue))),
+                        new XElement(p + "encryptedVerifier",
+                            new XAttribute("spinCount", spinCount),
+                            new XAttribute("saltValue", Convert.ToBase64String(keySalt)),
+                            new XAttribute("encryptedVerifierValue",
+                                Convert.ToBase64String(encryptedVerifier))),
+                        new XElement(p + "encryptedVerifierHash",
+                            new XAttribute("spinCount", spinCount),
+                            new XAttribute("saltValue", Convert.ToBase64String(keySalt)),
+                            new XAttribute("encryptedVerifierHashValue",
+                                Convert.ToBase64String(encryptedVerifierHash)))))),
             new XElement(ns + "dataIntegrity",
                 new XAttribute("encryptedHmacKey", Convert.ToBase64String(encryptedHmacKey)),
                 new XAttribute("encryptedHmacValue", Convert.ToBase64String(encryptedHmacValue)))
