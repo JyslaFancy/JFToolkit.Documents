@@ -75,22 +75,21 @@ internal static class AgileEncryption
         var paddedHash = PadToBlockSize(verifierHash, BlockSize);
         var encryptedVerifierHash = AesCbcEncrypt(paddedHash, hashKey, passwordSalt);
 
-        // Generate random data key, pad with 0x36, encrypt
-        var dataKey = RandomBytes(KeyBytes);
-        var paddedKey = PadWith0x36(dataKey);
+        // Generate random data key (16 bytes of entropy), pad with 0x36 to KeyBytes
+        var dataKeyEntropy = RandomBytes(SaltSize);
+        var paddedKey = PadWith0x36(dataKeyEntropy);
         var encryptedKeyValue = AesCbcEncrypt(paddedKey, keyValueKey, passwordSalt);
 
         // Encrypt the inner ZIP using keyDataSalt for IV derivation
-        var encryptedPackage = EncryptPackage(innerZip, dataKey, keyDataSalt);
+        var encryptedPackage = EncryptPackage(innerZip, paddedKey, keyDataSalt);
 
-        // Compute HMAC for integrity
-        var hmacKey = DeriveBlockKey(passwordHash, HmacKeyBlock);
-        var hmacValueKey = DeriveBlockKey(passwordHash, HmacValueBlock);
-        var encryptedHmacKey = AesCbcEncrypt(
-            PadToBlockSize(keyDataSalt, BlockSize), hmacKey, passwordSalt);
-        var hmacValue = ComputeHmac(keyDataSalt, encryptedPackage);
-        var encryptedHmacValue = AesCbcEncrypt(
-            PadToBlockSize(hmacValue, BlockSize), hmacValueKey, passwordSalt);
+        // Compute HMAC for integrity (matching msoffcrypto implementation)
+        var hmacSalt = RandomBytes(HashSize); // 64 bytes of random
+        var hmacIv1 = DeriveIv(keyDataSalt, HmacKeyBlock); // IV from keyDataSalt + blockKey
+        var hmacIv2 = DeriveIv(keyDataSalt, HmacValueBlock);
+        var encryptedHmacKey = AesCbcEncrypt(PadToBlockSize(hmacSalt, BlockSize), paddedKey, hmacIv1);
+        var hmacValue = ComputeHmac(hmacSalt, encryptedPackage);
+        var encryptedHmacValue = AesCbcEncrypt(PadToBlockSize(hmacValue, BlockSize), paddedKey, hmacIv2);
 
         // Build EncryptionInfo XML
         var encryptionInfo = BuildEncryptionInfoXml(
@@ -180,6 +179,11 @@ internal static class AgileEncryption
     private static byte[] DeriveIv(byte[] salt, int chunkIndex)
     {
         var blockKey = BitConverter.GetBytes(chunkIndex);
+        return DeriveIv(salt, blockKey);
+    }
+
+    private static byte[] DeriveIv(byte[] salt, byte[] blockKey)
+    {
         var input = new byte[salt.Length + blockKey.Length];
         Buffer.BlockCopy(salt, 0, input, 0, salt.Length);
         Buffer.BlockCopy(blockKey, 0, input, salt.Length, blockKey.Length);
@@ -200,9 +204,10 @@ internal static class AgileEncryption
 
     private static byte[] PadWith0x36(byte[] key)
     {
-        var result = new byte[KeyBytes * 2];
-        Buffer.BlockCopy(key, 0, result, 0, KeyBytes);
-        for (int i = KeyBytes; i < result.Length; i++)
+        // Pad to KeyBytes (32 for AES-256) with 0x36, per ECMA-376 / msoffcrypto
+        var result = new byte[KeyBytes];
+        Buffer.BlockCopy(key, 0, result, 0, key.Length);
+        for (int i = key.Length; i < result.Length; i++)
             result[i] = 0x36;
         return result;
     }

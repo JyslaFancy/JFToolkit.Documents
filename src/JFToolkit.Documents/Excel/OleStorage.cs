@@ -35,7 +35,10 @@ internal class OleStorage : IDisposable
 
     private readonly Dictionary<string, OleStreamInfo> _streams = new();
     private readonly List<uint> _fat = new();
+    private readonly List<uint> _miniFat = new();
     private readonly List<DirectoryEntry> _dirEntries = new();
+    private byte[] _miniStream = Array.Empty<byte>();
+    private uint _miniStreamCutoff = 4096;
 
     // Metadata streams required by ECMA-376 encrypted OLE2 containers.
     // These tell Excel what kind of encryption the file uses.
@@ -178,6 +181,28 @@ internal class OleStorage : IDisposable
             }
         }
 
+        // Read mini-FAT and mini-stream
+        _miniStreamCutoff = BitConverter.ToUInt32(header, 56);
+        var firstMiniFatSector = BitConverter.ToUInt32(header, 60);
+        var numMiniFatSectors = BitConverter.ToUInt32(header, 64);
+
+        _miniFat.Clear();
+        if (firstMiniFatSector != EndOfChain && numMiniFatSectors > 0)
+        {
+            var mfatSector = firstMiniFatSector;
+            for (int s = 0; s < numMiniFatSectors && mfatSector != EndOfChain; s++)
+            {
+                var sectorBytes = new byte[SectorSize];
+                ReadSector(file, mfatSector, sectorBytes);
+                for (int i = 0; i < 128; i++)
+                    _miniFat.Add(BitConverter.ToUInt32(sectorBytes, i * 4));
+                mfatSector = (uint)_fat.Count > mfatSector ? _fat[(int)mfatSector] : EndOfChain;
+            }
+        }
+
+        // Read mini-stream (Root Entry's data) — done after directory parsing
+        _miniStream = Array.Empty<byte>();
+
         // Read directory
         var dirSector = dirStartSector;
         var dirBytes = new List<byte>();
@@ -215,6 +240,18 @@ internal class OleStorage : IDisposable
 
             _dirEntries.Add(new DirectoryEntry(name, entryType, startSector, streamSize));
         }
+
+        // If Root Entry (index 0) has data, load mini-stream
+        if (numDirEntries > 0)
+        {
+            var rootOffset = 0 * DirEntrySize;
+            var rootStart = BitConverter.ToUInt32(dirBytes.ToArray(), rootOffset + 116);
+            var rootSize = BitConverter.ToUInt32(dirBytes.ToArray(), rootOffset + 120);
+            if (rootStart != EndOfChain && rootSize > 0)
+            {
+                _miniStream = ReadStreamDataRaw(file, rootStart, (int)rootSize);
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════
@@ -224,31 +261,77 @@ internal class OleStorage : IDisposable
     private static void WriteInternal(Stream output,
         List<(string Name, byte[] Data, byte Type, uint Left, uint Right, uint Child, byte Color)> entries)
     {
-        // Collect only stream entries (non-storage) for sector allocation
-        var streamEntries = entries
-            .Select((e, i) => (Index: i, Entry: e))
-            .Where(x => x.Entry.Type == StgtyStream || x.Entry.Type == StgtyRoot)
-            .ToList();
+        const int MiniSectorSize = 64;
+        const int MiniStreamCutoff = 4096;
 
-        var dirEntryCount = entries.Count;
-        var dirSectorCount = (dirEntryCount + 3) / 4;
+        // Separate streams into mini-stream (< 4096 bytes) and regular FAT (>= 4096)
+        var miniStreamEntries = new List<(int Index, byte[] Data)>();
+        var fatStreamEntries = new List<(int Index, byte[] Data)>();
 
-        var fatSectorCount = 1u;
-        var dirSectors = Enumerable.Range(1, dirSectorCount).Select(i => (uint)i).ToList();
-        var dataStart = (uint)(1 + dirSectorCount);
-
-        // Allocate data sectors for each stream
-        var streamAllocations = new Dictionary<int, List<uint>>();
-        uint nextSector = dataStart;
-        foreach (var (idx, entry) in streamEntries)
+        for (int i = 0; i < entries.Count; i++)
         {
-            var sectorsNeeded = (entry.Data.Length + SectorSize - 1) / SectorSize;
-            if (sectorsNeeded == 0) continue;
+            var e = entries[i];
+            if ((e.Type == StgtyStream || e.Type == StgtyRoot) && e.Data.Length > 0)
+            {
+                if (e.Data.Length < MiniStreamCutoff)
+                    miniStreamEntries.Add((i, e.Data));
+                else
+                    fatStreamEntries.Add((i, e.Data));
+            }
+        }
+
+        // Compute mini-sector layout
+        var miniSectorCount = 0;
+        var miniAllocations = new Dictionary<int, (int Start, int Count)>();
+        foreach (var (idx, data) in miniStreamEntries)
+        {
+            var count = (data.Length + MiniSectorSize - 1) / MiniSectorSize;
+            miniAllocations[idx] = (miniSectorCount, count);
+            miniSectorCount += count;
+        }
+
+        // Root Entry mini-stream: allocate regular sectors
+        var miniStreamBytes = miniSectorCount * MiniSectorSize;
+        var miniStreamSectors = (miniStreamBytes + SectorSize - 1) / SectorSize;
+
+        // Build mini-FAT
+        var miniFatEntries = miniSectorCount > 0 ? miniSectorCount + 1 : 0; // +1 for sentinel
+        var miniFat = new uint[miniFatEntries];
+        Array.Fill(miniFat, FreeSector);
+        if (miniFatEntries > 0)
+            miniFat[0] = EndOfChain; // sentinel: mini-FAT itself
+
+        foreach (var (idx, (start, count)) in miniAllocations)
+        {
+            for (int i = 0; i < count - 1; i++)
+                miniFat[start + i] = (uint)(start + i + 1);
+            miniFat[start + count - 1] = EndOfChain;
+        }
+
+        var miniFatSectorCount = (miniFatEntries * 4 + SectorSize - 1) / SectorSize;
+        var numMiniFatSectors = (uint)(miniFatEntries > 0 ? miniFatSectorCount : 0);
+
+        // Regular FAT streams
+        var fatStreamAllocations = new Dictionary<int, List<uint>>();
+        // Sector layout:
+        //   0: FAT          (1 sector)
+        //   1..: Directory  (dirSectorCount)
+        //   next: Mini-FAT sectors
+        //   next: Root mini-stream sectors
+        //   next: Regular FAT stream sectors
+
+        var dirSectorCount = Math.Max(1, (entries.Count + 3) / 4);
+        var dirSectors = Enumerable.Range(1, dirSectorCount).Select(i => (uint)i).ToList();
+        uint nextSector = (uint)(1 + dirSectorCount + miniFatSectorCount + miniStreamSectors);
+
+        foreach (var (idx, data) in fatStreamEntries)
+        {
+            var sectorsNeeded = (data.Length + SectorSize - 1) / SectorSize;
             var sectors = new List<uint>();
             for (int i = 0; i < sectorsNeeded; i++)
                 sectors.Add(nextSector + (uint)i);
             nextSector += (uint)sectorsNeeded;
-            streamAllocations[idx] = sectors;
+            fatStreamAllocations[idx] = sectors;
         }
 
         // Build FAT
@@ -257,62 +340,60 @@ internal class OleStorage : IDisposable
         Array.Fill(fat, FreeSector);
         fat[0] = EndOfChain; // FAT sector
 
-        // Directory sectors (chained)
+        // Directory sectors chain
         for (int i = 0; i < dirSectors.Count; i++)
+            fat[(int)dirSectors[i]] = (uint)(i < dirSectors.Count - 1 ? dirSectors[i + 1] : EndOfChain);
+
+        // Mini-FAT sectors chain
+        for (int i = 0; i < miniFatSectorCount; i++)
         {
-            var idx = (int)dirSectors[i];
-            fat[idx] = i < dirSectors.Count - 1 ? dirSectors[i + 1] : EndOfChain;
+            var sec = (uint)(1 + dirSectorCount + i);
+            fat[sec] = (uint)(i < miniFatSectorCount - 1 ? sec + 1 : EndOfChain);
         }
 
-        // Data sectors for each stream (chained)
-        foreach (var (entryIdx, sectors) in streamAllocations)
+        // Root mini-stream sectors chain
+        for (int i = 0; i < miniStreamSectors; i++)
+        {
+            var sec = (uint)(1 + dirSectorCount + miniFatSectorCount + i);
+            fat[sec] = (uint)(i < miniStreamSectors - 1 ? sec + 1 : EndOfChain);
+        }
+
+        // FAT stream sectors chain
+        foreach (var (_, sectors) in fatStreamAllocations)
         {
             for (int i = 0; i < sectors.Count; i++)
-            {
-                fat[(int)sectors[i]] = i < sectors.Count - 1 ? sectors[i + 1] : EndOfChain;
-            }
+                fat[(int)sectors[i]] = (uint)(i < sectors.Count - 1 ? sectors[i + 1] : EndOfChain);
         }
 
-        var difat = new List<uint> { 0 }; // FAT at sector 0
+        var difat = new List<uint> { 0 };
+        uint firstMiniFatSector = miniFatEntries > 0 ? (uint)(1 + dirSectorCount) : EndOfChain;
+        uint firstMiniStreamSector = miniStreamSectors > 0 ? (uint)(1 + dirSectorCount + miniFatSectorCount) : EndOfChain;
 
         // Write header
         var header = new byte[HeaderSize];
         BitConverter.TryWriteBytes(header.AsSpan(0), Magic);
-        // Offset 0x18-0x19: Minor Version (after 16-byte CLSID at 0x08-0x17)
-        header[24] = 0x3E; // minor version
-        header[25] = 0x00;
-        // Offset 0x1A-0x1B: Major Version
-        header[26] = 0x03; // major version
-        header[27] = 0x00;
-        // Offset 0x1C-0x1D: Byte Order (0xFFFE = little endian)
-        header[28] = 0xFE;
-        header[29] = 0xFF;
-        // Offset 0x1E-0x1F: Sector Size (9 → 2^9 = 512)
-        header[30] = 0x09;
-        header[31] = 0x00;
-        // Offset 0x20-0x21: Mini Sector Size (6 → 2^6 = 64)
-        header[32] = 0x06;
-        header[33] = 0x00;
-        BitConverter.TryWriteBytes(header.AsSpan(44), fatSectorCount);
-        BitConverter.TryWriteBytes(header.AsSpan(48), dirSectors[0]);
-        BitConverter.TryWriteBytes(header.AsSpan(52), 0u); // transaction sig (0 = finalized)
-        BitConverter.TryWriteBytes(header.AsSpan(56), 4096u); // mini stream cutoff
-        BitConverter.TryWriteBytes(header.AsSpan(60), EndOfChain); // first mini FAT
-        BitConverter.TryWriteBytes(header.AsSpan(64), 0u);        // mini FAT sectors
-        BitConverter.TryWriteBytes(header.AsSpan(68), EndOfChain); // no DIFAT chain
-        BitConverter.TryWriteBytes(header.AsSpan(72), 0u);        // DIFAT sectors
+        header[24] = 0x3E; header[25] = 0x00; // minor version
+        header[26] = 0x03; header[27] = 0x00; // major version
+        header[28] = 0xFE; header[29] = 0xFF; // byte order LE
+        header[30] = 0x09; header[31] = 0x00; // sector size 512
+        header[32] = 0x06; header[33] = 0x00; // mini sector size 64
+        BitConverter.TryWriteBytes(header.AsSpan(44), (uint)1); // num FAT sectors
+        BitConverter.TryWriteBytes(header.AsSpan(48), dirSectors[0]); // first dir sector
+        BitConverter.TryWriteBytes(header.AsSpan(52), 0u); // transaction sig
+        BitConverter.TryWriteBytes(header.AsSpan(56), (uint)MiniStreamCutoff); // mini stream cutoff
+        BitConverter.TryWriteBytes(header.AsSpan(60), firstMiniFatSector); // first mini FAT
+        BitConverter.TryWriteBytes(header.AsSpan(64), numMiniFatSectors); // num mini FAT
+        BitConverter.TryWriteBytes(header.AsSpan(68), EndOfChain); // no DIFAT
+        BitConverter.TryWriteBytes(header.AsSpan(72), 0u); // num DIFAT
 
         for (int i = 0; i < 109; i++)
-        {
-            var val = i < difat.Count ? difat[i] : FreeSector;
-            BitConverter.TryWriteBytes(header.AsSpan(76 + i * 4), val);
-        }
+            BitConverter.TryWriteBytes(header.AsSpan(76 + i * 4), i < difat.Count ? difat[i] : FreeSector);
 
         output.Write(header, 0, HeaderSize);
 
         // Write FAT
         var fatBytes = new byte[SectorSize];
-        for (int i = 0; i < Math.Min(fat.Length, 128); i++)
+        for (int i = 0; i < Math.Min(fat.Length, SectorSize / 4); i++)
             BitConverter.TryWriteBytes(fatBytes.AsSpan(i * 4), fat[i]);
         output.Write(fatBytes, 0, SectorSize);
 
@@ -321,15 +402,58 @@ internal class OleStorage : IDisposable
         for (int i = 0; i < entries.Count; i++)
         {
             var e = entries[i];
-            uint startSector = streamAllocations.TryGetValue(i, out var secs) && secs.Count > 0
-                ? secs[0] : EndOfChain;
+            uint startSector;
+            int streamSize = e.Data.Length;
+
+            if (e.Type == StgtyRoot)
+            {
+                // Root Entry: start of mini-stream (regular sectors), size = mini-stream size
+                startSector = firstMiniStreamSector;
+                streamSize = miniStreamBytes;
+            }
+            else if (miniAllocations.TryGetValue(i, out var miniAlloc))
+            {
+                // Mini-stream: StartSector is mini-sector index, size unchanged
+                startSector = (uint)miniAlloc.Start;
+                streamSize = e.Data.Length;
+            }
+            else if (fatStreamAllocations.TryGetValue(i, out var fatSecs) && fatSecs.Count > 0)
+            {
+                startSector = fatSecs[0];
+            }
+            else
+            {
+                startSector = EndOfChain;
+            }
+
             WriteDirectoryEntry(dirBytes, i * DirEntrySize,
-                e.Name, e.Type, e.Left, e.Right, e.Child, startSector, e.Data.Length, e.Color);
+                e.Name, e.Type, e.Left, e.Right, e.Child, startSector, streamSize, e.Color);
         }
         output.Write(dirBytes, 0, dirBytes.Length);
 
-        // Write data sectors
-        foreach (var (idx, sectors) in streamAllocations)
+        // Write mini-FAT sectors
+        if (miniFatEntries > 0)
+        {
+            var mfatBytes = new byte[miniFatSectorCount * SectorSize];
+            for (int i = 0; i < miniFatEntries; i++)
+                BitConverter.TryWriteBytes(mfatBytes.AsSpan(i * 4), miniFat[i]);
+            output.Write(mfatBytes, 0, mfatBytes.Length);
+        }
+
+        // Write Root mini-stream sectors
+        if (miniStreamBytes > 0)
+        {
+            var msBytes = new byte[miniStreamSectors * SectorSize];
+            foreach (var (idx, data) in miniStreamEntries)
+            {
+                var (start, _) = miniAllocations[idx];
+                Buffer.BlockCopy(data, 0, msBytes, start * MiniSectorSize, data.Length);
+            }
+            output.Write(msBytes, 0, msBytes.Length);
+        }
+
+        // Write FAT stream sectors
+        foreach (var (idx, sectors) in fatStreamAllocations)
         {
             var data = entries[idx].Data;
             for (int i = 0; i < sectors.Count; i++)
@@ -397,17 +521,20 @@ internal class OleStorage : IDisposable
         return ReadStreamData(info.StartSector, info.Size, info.File);
     }
 
-    private byte[] ReadStreamData(uint startSector, uint size, Stream file)
+    /// <summary>
+    /// Read stream data using regular FAT sectors (for Root Entry mini-stream).
+    /// </summary>
+    private byte[] ReadStreamDataRaw(Stream file, uint startSector, int size)
     {
         var result = new byte[size];
         var offset = 0;
         var sector = startSector;
 
-        while (sector != EndOfChain && offset < size)
+        while (sector != EndOfChain && sector != FreeSector && offset < size)
         {
             var sectorBytes = new byte[SectorSize];
             ReadSector(file, sector, sectorBytes);
-            var toCopy = (int)Math.Min(SectorSize, size - offset);
+            var toCopy = Math.Min(SectorSize, size - offset);
             Array.Copy(sectorBytes, 0, result, offset, toCopy);
             offset += toCopy;
 
@@ -417,6 +544,42 @@ internal class OleStorage : IDisposable
 
         return result;
     }
+
+    /// <summary>
+    /// Read stream data, using mini-FAT if the stream qualifies.
+    /// </summary>
+    private byte[] ReadStreamData(uint startSector, uint size, Stream file)
+    {
+        // Determine if this is a mini-stream entry
+        if (_miniStream.Length > 0 && size < _miniStreamCutoff 
+            && startSector != EndOfChain && startSector != FreeSector
+            && startSector < _miniFat.Count)
+        {
+            const int MiniSectorSize = 64;
+            var result = new byte[size];
+            var offset = 0;
+            var miniSector = startSector;
+
+            while (miniSector != EndOfChain && miniSector != FreeSector && offset < size)
+            {
+                var srcOffset = (int)(miniSector * MiniSectorSize);
+                if (srcOffset + MiniSectorSize > _miniStream.Length) break;
+                var toCopy = (int)Math.Min(MiniSectorSize, size - offset);
+                Buffer.BlockCopy(_miniStream, srcOffset, result, offset, toCopy);
+                offset += toCopy;
+
+                if (miniSector >= (uint)_miniFat.Count) break;
+                miniSector = _miniFat[(int)miniSector];
+            }
+
+            return result;
+        }
+
+        // Regular FAT stream
+        return ReadStreamDataRaw(file, startSector, (int)size);
+    }
+
+    // Old method removed — replaced by ReadStreamData and ReadStreamDataRaw above
 
     // ── Metadata stream builders ──
 
