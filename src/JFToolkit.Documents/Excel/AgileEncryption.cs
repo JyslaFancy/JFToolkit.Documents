@@ -65,31 +65,31 @@ internal static class AgileEncryption
         var hashKey = DeriveBlockKey(passwordHash, VerifierHashValueBlockKey);
         var keyValueKey = DeriveBlockKey(passwordHash, EncryptedKeyValueBlockKey);
 
-        // Generate random verifier (16 bytes), pad to block, encrypt
+        // Generate random verifier (16 bytes), pad to block, encrypt (NO PKCS7)
         var verifier = RandomBytes(SaltSize);
         var paddedVerifier = PadToBlockSize(verifier, BlockSize);
-        var encryptedVerifier = AesCbcEncrypt(paddedVerifier, verifierKey, passwordSalt);
+        var encryptedVerifier = AesCbcEncryptNoPadding(paddedVerifier, verifierKey, passwordSalt);
 
-        // Hash the ORIGINAL verifier (not padded), pad, encrypt
+        // Hash the ORIGINAL verifier (not padded), pad, encrypt (NO PKCS7)
         var verifierHash = SHA512.HashData(verifier);
         var paddedHash = PadToBlockSize(verifierHash, BlockSize);
-        var encryptedVerifierHash = AesCbcEncrypt(paddedHash, hashKey, passwordSalt);
+        var encryptedVerifierHash = AesCbcEncryptNoPadding(paddedHash, hashKey, passwordSalt);
 
-        // Generate random data key (16 bytes of entropy), pad with 0x36 to KeyBytes
+        // Generate random data key (16 bytes of entropy), pad with 0x36 to KeyBytes, encrypt (NO PKCS7)
         var dataKeyEntropy = RandomBytes(SaltSize);
         var paddedKey = PadWith0x36(dataKeyEntropy);
-        var encryptedKeyValue = AesCbcEncrypt(paddedKey, keyValueKey, passwordSalt);
+        var encryptedKeyValue = AesCbcEncryptNoPadding(paddedKey, keyValueKey, passwordSalt);
 
-        // Encrypt the inner ZIP using keyDataSalt for IV derivation
+        // Encrypt the inner ZIP using keyDataSalt for IV derivation (PKCS7 padding for last segment)
         var encryptedPackage = EncryptPackage(innerZip, paddedKey, keyDataSalt);
 
         // Compute HMAC for integrity (matching msoffcrypto implementation)
         var hmacSalt = RandomBytes(HashSize); // 64 bytes of random
-        var hmacIv1 = DeriveIv(keyDataSalt, HmacKeyBlock); // IV from keyDataSalt + blockKey
+        var hmacIv1 = DeriveIv(keyDataSalt, HmacKeyBlock);
         var hmacIv2 = DeriveIv(keyDataSalt, HmacValueBlock);
-        var encryptedHmacKey = AesCbcEncrypt(PadToBlockSize(hmacSalt, BlockSize), paddedKey, hmacIv1);
+        var encryptedHmacKey = AesCbcEncryptNoPadding(PadToBlockSize(hmacSalt, BlockSize), paddedKey, hmacIv1);
         var hmacValue = ComputeHmac(hmacSalt, encryptedPackage);
-        var encryptedHmacValue = AesCbcEncrypt(PadToBlockSize(hmacValue, BlockSize), paddedKey, hmacIv2);
+        var encryptedHmacValue = AesCbcEncryptNoPadding(PadToBlockSize(hmacValue, BlockSize), paddedKey, hmacIv2);
 
         // Build EncryptionInfo XML
         var encryptionInfo = BuildEncryptionInfoXml(
@@ -152,6 +152,31 @@ internal static class AgileEncryption
     //  ENCRYPTION / DECRYPTION HELPERS
     // ═══════════════════════════════════════════════
 
+    /// <summary>
+    /// AES-CBC encrypt WITHOUT PKCS7 padding. Data MUST be block-aligned.
+    /// Used for encrypting EncryptionInfo values (verifier, key, hashes).
+    /// All values are pre-padded to block size by the caller.
+    /// </summary>
+    private static byte[] AesCbcEncryptNoPadding(byte[] data, byte[] key, byte[] iv)
+    {
+        if (data.Length % BlockSize != 0)
+            throw new ArgumentException("Data must be block-aligned for no-padding encrypt.");
+
+        using var aes = Aes.Create();
+        aes.Key = key;
+        aes.Mode = CipherMode.CBC;
+        aes.Padding = PaddingMode.None;
+        aes.IV = iv;
+
+        using var encryptor = aes.CreateEncryptor();
+        // TransformFinalBlock with PaddingMode.None on block-aligned data: no padding added
+        return encryptor.TransformFinalBlock(data, 0, data.Length);
+    }
+
+    /// <summary>
+    /// AES-CBC encrypt WITH PKCS7 padding. Used for EncryptedPackage segments
+    /// where the last segment may not be block-aligned.
+    /// </summary>
     private static byte[] AesCbcEncrypt(byte[] data, byte[] key, byte[] iv)
     {
         using var aes = Aes.Create();
@@ -162,6 +187,22 @@ internal static class AgileEncryption
 
         using var encryptor = aes.CreateEncryptor();
         return encryptor.TransformFinalBlock(data, 0, data.Length);
+    }
+
+    /// <summary>
+    /// AES-CBC decrypt WITHOUT PKCS7 padding. Used for EncryptionInfo values
+    /// (verifier, key, hashes) which were encrypted block-aligned.
+    /// </summary>
+    private static byte[] AesCbcDecryptNoPadding(byte[] data, byte[] key, byte[] iv)
+    {
+        using var aes = Aes.Create();
+        aes.Key = key;
+        aes.Mode = CipherMode.CBC;
+        aes.Padding = PaddingMode.None;
+        aes.IV = iv;
+
+        using var decryptor = aes.CreateDecryptor();
+        return decryptor.TransformFinalBlock(data, 0, data.Length);
     }
 
     private static byte[] AesCbcDecrypt(byte[] data, byte[] key, byte[] iv)
@@ -281,10 +322,10 @@ internal static class AgileEncryption
             var verifierKey = DeriveBlockKey(passwordHash, VerifierHashInputBlockKey);
             var hashKey = DeriveBlockKey(passwordHash, VerifierHashValueBlockKey);
 
-            // Verify password: decrypt verifier, hash it, compare with decrypted hash
-            var decryptedVerifier = AesCbcDecrypt(info.EncryptedVerifierHashInput, verifierKey, info.PasswordSalt);
+            // Verify password: decrypt verifier, hash it, compare with decrypted hash (NO PKCS7)
+            var decryptedVerifier = AesCbcDecryptNoPadding(info.EncryptedVerifierHashInput, verifierKey, info.PasswordSalt);
             var expectedHash = SHA512.HashData(decryptedVerifier);
-            var actualHash = AesCbcDecrypt(info.EncryptedVerifierHashValue, hashKey, info.PasswordSalt);
+            var actualHash = AesCbcDecryptNoPadding(info.EncryptedVerifierHashValue, hashKey, info.PasswordSalt);
 
             // Truncate to original hash size
             if (!CryptographicOperations.FixedTimeEquals(
@@ -292,9 +333,9 @@ internal static class AgileEncryption
                 actualHash.AsSpan(0, HashSize)))
                 throw new InvalidOperationException("Wrong password.");
 
-            // Derive key encryption key and recover data key
+            // Derive key encryption key and recover data key (NO PKCS7)
             var keyValueKey = DeriveBlockKey(passwordHash, EncryptedKeyValueBlockKey);
-            var paddedKey = AesCbcDecrypt(info.EncryptedKeyValue, keyValueKey, info.PasswordSalt);
+            var paddedKey = AesCbcDecryptNoPadding(info.EncryptedKeyValue, keyValueKey, info.PasswordSalt);
             var dataKey = new byte[KeyBytes];
             Buffer.BlockCopy(paddedKey, 0, dataKey, 0, KeyBytes);
 
