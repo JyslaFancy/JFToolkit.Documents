@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>JFToolkit.Documents</RootNamespace>
+    <AssemblyName>JFToolkit.Documents</AssemblyName>
+    <PackageId>JFToolkit.Documents</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Harald Daltveit</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Description>Zero-dependency .NET library for reading/writing Excel (.xlsx), CSV, and JSON files. AI-optimized API — one method per format, auto-detection.</Description>
+    <PackageTags>excel csv json documents reader writer ai agent zero-dependency xlsx</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>
