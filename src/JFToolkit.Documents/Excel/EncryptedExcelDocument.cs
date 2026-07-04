@@ -66,7 +66,7 @@ public class EncryptedExcelDocument : IDisposable
                 // Plain ZIP (unencrypted)
                 fs.Position = 0;
                 zipBytes = new byte[fs.Length];
-                fs.Read(zipBytes, 0, zipBytes.Length);
+                fs.ReadExactly(zipBytes, 0, zipBytes.Length);
             }
         }
 
@@ -196,7 +196,7 @@ public class EncryptedExcelDocument : IDisposable
         {
             using var fs = File.OpenRead(path);
             var magic = new byte[8];
-            fs.Read(magic, 0, 8);
+            fs.ReadExactly(magic, 0, 8);
             fs.Position = 0;
 
             // PK\x03\x04 = ZIP (unencrypted .xlsx)

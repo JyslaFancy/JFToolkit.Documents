@@ -29,9 +29,9 @@ internal class OleStorage : IDisposable
     private readonly List<uint> _fat = new();
     private readonly List<DirectoryEntry> _dirEntries = new();
 
-    private bool _disposed;
-
-    // ── Public structure ──
+    public void Dispose()
+    {
+    }
     public IReadOnlyDictionary<string, OleStreamInfo> Streams { get; }
 
     private readonly Dictionary<string, OleStreamInfo> _streams = new();
@@ -395,11 +395,6 @@ internal class OleStorage : IDisposable
         }
 
         return result;
-    }
-
-    public void Dispose()
-    {
-        _disposed = true;
     }
 
     // ── Inner types ──

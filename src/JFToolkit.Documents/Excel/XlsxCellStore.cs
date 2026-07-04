@@ -228,7 +228,7 @@ internal class XlsxCellStore
         {
             using var stream = entry.Open();
             var entryData = new byte[entry.Length];
-            stream.Read(entryData, 0, entryData.Length);
+            stream.ReadExactly(entryData, 0, entryData.Length);
             _zipEntries[entry.FullName] = entryData;
         }
     }

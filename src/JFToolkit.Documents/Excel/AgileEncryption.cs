@@ -116,7 +116,7 @@ internal static class AgileEncryption
     {
         var magic = new byte[8];
         var pos = stream.Position;
-        stream.Read(magic, 0, 8);
+        stream.ReadExactly(magic, 0, 8);
         stream.Position = pos;
         return BitConverter.ToUInt64(magic, 0) == 0xE11AB1A1E011CFD0;
     }
