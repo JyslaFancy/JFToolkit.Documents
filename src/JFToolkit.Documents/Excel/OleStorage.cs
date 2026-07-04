@@ -21,6 +21,7 @@ internal class OleStorage : IDisposable
     private const uint FreeSector = 0xFFFFFFFF;
     private const uint FatSector = 0xFFFFFFFD;
     private const uint DifSector = 0xFFFFFFFC;
+    private const uint NoStream = 0xFFFFFFFF; // red-black tree null
 
     // ── Directory entry types ──
     private const byte StgtyEmpty = 0;
@@ -65,43 +66,51 @@ internal class OleStorage : IDisposable
     /// </summary>
     public static void Write(Stream output, params (string Name, byte[] Data)[] userStreams)
     {
-        // Build full stream list with required metadata
-        var allStreams = new List<(string Name, byte[] Data, byte Type, uint LeftSibling, uint RightSibling, uint ChildId)>();
+        // Tree structure matching msoffcrypto-tool / herumi/msoffice reference:
+        //   Root (RED) → child → EncryptionInfo (BLACK)
+        //     EncryptionInfo → left → DataSpaces (RED), right → EncryptedPackage (RED)
+        //       DataSpaces (RED) → child → DataSpaceMap (BLACK)
+        //         DataSpaceMap → left → Version (BLACK), right → DataSpaceInfo (BLACK)
+        //           DataSpaceInfo → right → TransformInfo (RED), child → StrongEncryptionDataSpace (BLACK)
+        //             TransformInfo → child → StrongEncryptionTransform (BLACK)
+        //               StrongEncryptionTransform → child → Primary (BLACK)
+        var allStreams = new List<(string Name, byte[] Data, byte Type, uint LeftSibling, uint RightSibling, uint ChildId, byte Color)>();
 
-        // Root Entry (must be first)
-        allStreams.Add(("Root Entry", Array.Empty<byte>(), StgtyRoot, EndOfChain, EndOfChain, 0x00000001));
-
-        // EncryptedPackage (user data)
         var encPkg = userStreams.FirstOrDefault(s => s.Name == "EncryptedPackage");
-        allStreams.Add(("EncryptedPackage", encPkg.Data, StgtyStream, EndOfChain, EndOfChain, EndOfChain));
-
-        // DataSpaces storage
-        allStreams.Add(("\x06DataSpaces", Array.Empty<byte>(), StgtyStorage, EndOfChain, EndOfChain, 0x00000003));
-
-        // Version stream (in DataSpaces)
-        allStreams.Add(("Version", VersionStream, StgtyStream, EndOfChain, EndOfChain, EndOfChain));
-
-        // DataSpaceMap stream
-        allStreams.Add(("DataSpaceMap", DataSpaceMapStream, StgtyStream, 0x00000003, 0x00000005, EndOfChain));
-
-        // DataSpaceInfo storage
-        allStreams.Add(("DataSpaceInfo", Array.Empty<byte>(), StgtyStorage, EndOfChain, EndOfChain, 0x00000006));
-
-        // StrongEncryptionDataSpace stream
-        allStreams.Add(("StrongEncryptionDataSpace", StrongEncryptionDataSpaceStream, StgtyStream, EndOfChain, EndOfChain, EndOfChain));
-
-        // TransformInfo storage
-        allStreams.Add(("TransformInfo", Array.Empty<byte>(), StgtyStorage, EndOfChain, EndOfChain, 0x00000008));
-
-        // StrongEncryptionTransform storage
-        allStreams.Add(("StrongEncryptionTransform", Array.Empty<byte>(), StgtyStorage, EndOfChain, EndOfChain, 0x00000009));
-
-        // Primary stream
-        allStreams.Add(("\x06Primary", PrimaryStream, StgtyStream, EndOfChain, EndOfChain, EndOfChain));
-
-        // EncryptionInfo (user data)
         var encInfo = userStreams.FirstOrDefault(s => s.Name == "EncryptionInfo");
-        allStreams.Add(("EncryptionInfo", encInfo.Data, StgtyStream, 0x00000002, 0x00000001, EndOfChain));
+
+        // 0: Root Entry — RED, child→EncryptionInfo(10)
+        allStreams.Add(("Root Entry", Array.Empty<byte>(), StgtyRoot, NoStream, NoStream, 10, ColorRed));
+
+        // 1: EncryptedPackage — RED, right sibling of EncryptionInfo
+        allStreams.Add(("EncryptedPackage", encPkg.Data, StgtyStream, NoStream, NoStream, NoStream, ColorRed));
+
+        // 2: DataSpaces — RED, left sibling of EncryptionInfo
+        allStreams.Add(("\x06DataSpaces", Array.Empty<byte>(), StgtyStorage, NoStream, NoStream, 4, ColorRed));
+
+        // 3: Version — BLACK, left sibling of DataSpaceMap
+        allStreams.Add(("Version", VersionStream, StgtyStream, NoStream, NoStream, NoStream, ColorBlack));
+
+        // 4: DataSpaceMap — BLACK, child of DataSpaces, left→Version, right→DataSpaceInfo
+        allStreams.Add(("DataSpaceMap", DataSpaceMapStream, StgtyStream, 3, 5, NoStream, ColorBlack));
+
+        // 5: DataSpaceInfo — BLACK, right sibling of DataSpaceMap, right→TransformInfo, child→StrongEncryptionDataSpace
+        allStreams.Add(("DataSpaceInfo", Array.Empty<byte>(), StgtyStorage, NoStream, 7, 6, ColorBlack));
+
+        // 6: StrongEncryptionDataSpace — BLACK, child of DataSpaceInfo
+        allStreams.Add(("StrongEncryptionDataSpace", StrongEncryptionDataSpaceStream, StgtyStream, NoStream, NoStream, NoStream, ColorBlack));
+
+        // 7: TransformInfo — RED, right sibling of DataSpaceInfo, child→StrongEncryptionTransform
+        allStreams.Add(("TransformInfo", Array.Empty<byte>(), StgtyStorage, NoStream, NoStream, 8, ColorRed));
+
+        // 8: StrongEncryptionTransform — BLACK, child of TransformInfo
+        allStreams.Add(("StrongEncryptionTransform", Array.Empty<byte>(), StgtyStorage, NoStream, NoStream, 9, ColorBlack));
+
+        // 9: Primary — BLACK, child of StrongEncryptionTransform
+        allStreams.Add(("\x06Primary", PrimaryStream, StgtyStream, NoStream, NoStream, NoStream, ColorBlack));
+
+        // 10: EncryptionInfo — BLACK, child of Root, left→DataSpaces, right→EncryptedPackage
+        allStreams.Add(("EncryptionInfo", encInfo.Data, StgtyStream, 2, 1, NoStream, ColorBlack));
 
         WriteInternal(output, allStreams);
     }
@@ -124,7 +133,7 @@ internal class OleStorage : IDisposable
         if (magic != Magic)
             throw new InvalidDataException("Not a valid OLE2 compound file.");
 
-        var majorVersion = header[23];
+        var majorVersion = header[26];
         if (majorVersion != 3)
             throw new NotSupportedException(
                 $"OLE2 version {majorVersion} is not supported. Only v3 (512-byte sectors).");
@@ -213,7 +222,7 @@ internal class OleStorage : IDisposable
     // ═══════════════════════════════════════════════
 
     private static void WriteInternal(Stream output,
-        List<(string Name, byte[] Data, byte Type, uint Left, uint Right, uint Child)> entries)
+        List<(string Name, byte[] Data, byte Type, uint Left, uint Right, uint Child, byte Color)> entries)
     {
         // Collect only stream entries (non-storage) for sector allocation
         var streamEntries = entries
@@ -269,14 +278,24 @@ internal class OleStorage : IDisposable
         // Write header
         var header = new byte[HeaderSize];
         BitConverter.TryWriteBytes(header.AsSpan(0), Magic);
-        header[22] = 0x3E; // minor version
-        header[23] = 3;    // major version
-        header[24] = 0xFE; header[25] = 0xFF; // little endian
-        header[26] = 9;    // sector size = 512
-        header[27] = 6;    // mini sector size = 64
+        // Offset 0x18-0x19: Minor Version (after 16-byte CLSID at 0x08-0x17)
+        header[24] = 0x3E; // minor version
+        header[25] = 0x00;
+        // Offset 0x1A-0x1B: Major Version
+        header[26] = 0x03; // major version
+        header[27] = 0x00;
+        // Offset 0x1C-0x1D: Byte Order (0xFFFE = little endian)
+        header[28] = 0xFE;
+        header[29] = 0xFF;
+        // Offset 0x1E-0x1F: Sector Size (9 → 2^9 = 512)
+        header[30] = 0x09;
+        header[31] = 0x00;
+        // Offset 0x20-0x21: Mini Sector Size (6 → 2^6 = 64)
+        header[32] = 0x06;
+        header[33] = 0x00;
         BitConverter.TryWriteBytes(header.AsSpan(44), fatSectorCount);
         BitConverter.TryWriteBytes(header.AsSpan(48), dirSectors[0]);
-        BitConverter.TryWriteBytes(header.AsSpan(52), EndOfChain);
+        BitConverter.TryWriteBytes(header.AsSpan(52), 0u); // transaction sig (0 = finalized)
         BitConverter.TryWriteBytes(header.AsSpan(56), 4096u); // mini stream cutoff
         BitConverter.TryWriteBytes(header.AsSpan(60), EndOfChain); // first mini FAT
         BitConverter.TryWriteBytes(header.AsSpan(64), 0u);        // mini FAT sectors
@@ -305,7 +324,7 @@ internal class OleStorage : IDisposable
             uint startSector = streamAllocations.TryGetValue(i, out var secs) && secs.Count > 0
                 ? secs[0] : EndOfChain;
             WriteDirectoryEntry(dirBytes, i * DirEntrySize,
-                e.Name, e.Type, e.Left, e.Right, e.Child, startSector, e.Data.Length);
+                e.Name, e.Type, e.Left, e.Right, e.Child, startSector, e.Data.Length, e.Color);
         }
         output.Write(dirBytes, 0, dirBytes.Length);
 
@@ -327,7 +346,7 @@ internal class OleStorage : IDisposable
 
     private static void WriteDirectoryEntry(byte[] buffer, int offset, string name,
         byte entryType, uint leftSibling, uint rightSibling, uint childId,
-        uint startSector, int streamSize)
+        uint startSector, int streamSize, byte color)
     {
         var utf16Name = System.Text.Encoding.Unicode.GetBytes(name + '\0');
         if (utf16Name.Length > 64)
@@ -335,7 +354,7 @@ internal class OleStorage : IDisposable
         Array.Copy(utf16Name, 0, buffer, offset, utf16Name.Length);
         BitConverter.TryWriteBytes(buffer.AsSpan(offset + 64), (ushort)utf16Name.Length);
         buffer[offset + 66] = entryType;
-        buffer[offset + 67] = (byte)(entryType == StgtyRoot ? ColorBlack : ColorRed);
+        buffer[offset + 67] = color;
         BitConverter.TryWriteBytes(buffer.AsSpan(offset + 68), leftSibling);
         BitConverter.TryWriteBytes(buffer.AsSpan(offset + 72), rightSibling);
         BitConverter.TryWriteBytes(buffer.AsSpan(offset + 76), childId);
