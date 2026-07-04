@@ -256,11 +256,11 @@ internal static class AgileEncryption
     private static EncryptionInfoData ParseEncryptionInfo(byte[] raw)
     {
         // The EncryptionInfo stream contains:
-        // - First 4 bytes: version (major.minor, 2+2)
+        // - First 8 bytes: version (2+2) + flags (4)
         // - Followed by XML
         using var ms = new MemoryStream(raw);
-        var version = new byte[4];
-        ms.Read(version, 0, 4);
+        var header = new byte[8];
+        ms.ReadExactly(header, 0, 8);
 
         var xml = XElement.Load(ms);
         var ns = xml.GetDefaultNamespace();
@@ -451,12 +451,14 @@ internal static class AgileEncryption
                 new XAttribute("encryptedHmacValue", Convert.ToBase64String(encryptedHmacValue)))
         );
 
-        // Prepend version (4.4 = "Agile Encryption" major.minor)
-        var version = new byte[] { 4, 0, 4, 0 };
+        // Prepend version + flags (8 bytes per ECMA-376)
+        // Bytes 0-1: MajorVersion=4, 2-3: MinorVersion=4
+        // Bytes 4-7: EncryptionFlags (0x40 = fAgile)
+        var header = new byte[] { 4, 0, 4, 0, 0x40, 0, 0, 0 };
         var xmlBytes = Encoding.UTF8.GetBytes(doc.ToString(SaveOptions.DisableFormatting));
-        var result = new byte[version.Length + xmlBytes.Length];
-        Buffer.BlockCopy(version, 0, result, 0, version.Length);
-        Buffer.BlockCopy(xmlBytes, 0, result, version.Length, xmlBytes.Length);
+        var result = new byte[header.Length + xmlBytes.Length];
+        Buffer.BlockCopy(header, 0, result, 0, header.Length);
+        Buffer.BlockCopy(xmlBytes, 0, result, header.Length, xmlBytes.Length);
         return result;
     }
 
